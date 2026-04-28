@@ -18,6 +18,7 @@ class QQIPPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
         self._group_records: dict[str, dict[str, dict[str, Any]]] = {}
+        self._group_activity: dict[str, dict[str, datetime]] = {}
         self._ip_location_cache: dict[str, str] = {}
         self._max_records_per_group = 100
         self._show_limit = 10
@@ -35,12 +36,15 @@ class QQIPPlugin(Star):
         if not group_id:
             return
 
+        sender_id = str(self._get_sender_id(message_obj) or "unknown")
+        sender_name = str(event.get_sender_name() or sender_id)
+
+        # 即便没有 IP，也记录发言痕迹，便于查询时给出准确提示。
+        self._group_activity.setdefault(group_id, {})[sender_id] = datetime.now()
+
         ip_list = self._extract_ips(message_obj)
         if not ip_list:
             return
-
-        sender_id = str(self._get_sender_id(message_obj) or "unknown")
-        sender_name = str(event.get_sender_name() or sender_id)
 
         group_map = self._group_records.setdefault(group_id, {})
         for ip in ip_list:
@@ -78,10 +82,6 @@ class QQIPPlugin(Star):
             return
 
         records_map = self._group_records.get(group_id, {})
-        if not records_map:
-            yield event.plain_result("暂无可用数据。先让群里有人发言后再试。")
-            return
-
         records = sorted(
             [rec for rec in records_map.values() if str(rec.get("sender_id", "")) == target_qq],
             key=lambda item: item.get("timestamp", datetime.min),
@@ -89,7 +89,19 @@ class QQIPPlugin(Star):
         )[: self._show_limit]
 
         if not records:
-            yield event.plain_result(f"未找到 QQ {target_qq} 的 IP 记录。")
+            last_seen = self._group_activity.get(group_id, {}).get(target_qq)
+            if isinstance(last_seen, datetime):
+                yield event.plain_result(
+                    "\n".join(
+                        [
+                            f"QQ {target_qq} 有发言记录。",
+                            f"最近发言时间: {last_seen.strftime('%Y.%m.%d-%H:%M:%S')}",
+                            "但当前平台事件未提供可用 IP 字段，无法定位到市。",
+                        ]
+                    )
+                )
+            else:
+                yield event.plain_result(f"未找到 QQ {target_qq} 的发言记录。")
             return
 
         lines: list[str] = [f"QQ {target_qq} 的 IP 记录", "===================="]
@@ -126,7 +138,7 @@ class QQIPPlugin(Star):
             return
 
         self._group_records[group_id] = {}
-        yield event.plain_result("已清空当前群的窥屏记录。")
+        yield event.plain_result("已清空当前群的 qqip 记录。")
 
     async def _resolve_ip_location(self, ip: str) -> str:
         if not ip:
@@ -166,21 +178,36 @@ class QQIPPlugin(Star):
     def _extract_ips(self, message_obj: Any) -> list[str]:
         result: set[str] = set()
         raw_message = getattr(message_obj, "raw_message", None)
+        roots = [raw_message, message_obj]
 
         candidates: list[Any] = []
-        for key in ("ip", "client_ip", "remote_ip", "sender_ip", "source_ip", "peer_ip"):
-            val = self._deep_get(raw_message, key)
-            if val:
-                candidates.append(val)
+        for root in roots:
+            for key in (
+                "ip",
+                "client_ip",
+                "remote_ip",
+                "sender_ip",
+                "source_ip",
+                "peer_ip",
+                "clientIp",
+                "remoteIp",
+                "senderIp",
+                "sourceIp",
+                "peerIp",
+            ):
+                val = self._deep_get(root, key)
+                if val:
+                    candidates.append(val)
 
         for c in candidates:
             for ip in self._find_ips_from_value(c):
                 result.add(ip)
 
         if not result:
-            # 兜底：遍历原始对象，但跳过文本消息字段，减少误提取概率
-            for ip in self._scan_ips_fallback(raw_message):
-                result.add(ip)
+            # 兜底：遍历原始对象和消息对象，但跳过文本消息字段，减少误提取概率
+            for root in roots:
+                for ip in self._scan_ips_fallback(root):
+                    result.add(ip)
 
         return sorted(result)
 
@@ -188,7 +215,7 @@ class QQIPPlugin(Star):
         if depth > 6:
             return set()
 
-        bad_keys = {"message", "message_str", "text", "content", "raw_message"}
+        bad_keys = {"message", "message_str", "text", "content"}
         found: set[str] = set()
 
         if isinstance(obj, dict):
@@ -229,9 +256,13 @@ class QQIPPlugin(Star):
         if obj is None or depth > 6:
             return None
 
+        target_key_norm = self._normalize_key(target_key)
+
         if isinstance(obj, dict):
-            if target_key in obj:
-                return obj[target_key]
+            for k, v in obj.items():
+                if self._normalize_key(k) == target_key_norm:
+                    return v
+
             for v in obj.values():
                 found = self._deep_get(v, target_key, depth + 1)
                 if found is not None:
@@ -249,6 +280,9 @@ class QQIPPlugin(Star):
             return self._deep_get(vars(obj), target_key, depth + 1)
 
         return None
+
+    def _normalize_key(self, key: Any) -> str:
+        return str(key).replace("_", "").lower()
 
     def _get_sender_id(self, message_obj: Any) -> str:
         sender = getattr(message_obj, "sender", None)
