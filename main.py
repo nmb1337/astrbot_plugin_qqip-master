@@ -11,7 +11,7 @@ from urllib.parse import urlparse
 
 import httpx
 
-from astrbot.api import logger
+from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 
@@ -21,8 +21,9 @@ IPV6_RE = re.compile(r"\b(?:[0-9a-fA-F]{1,4}:){2,7}[0-9a-fA-F]{1,4}\b")
 
 @register("astrbot_plugin_qqip", "qqip", "群聊 IP 归属地记录与查询", "1.0.0")
 class QQIPPlugin(Star):
-    def __init__(self, context: Context):
+    def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
+        self.config = config or {}
         self._group_records: dict[str, dict[str, dict[str, Any]]] = {}
         self._group_activity: dict[str, dict[str, datetime]] = {}
         self._group_sender_meta: dict[str, dict[str, dict[str, str]]] = {}
@@ -31,14 +32,27 @@ class QQIPPlugin(Star):
         self._consent_records: dict[str, list[dict[str, str]]] = {}
         self._consent_lock = threading.Lock()
         self._hash_salt = secrets.token_hex(16)
-        self._listen_host = os.getenv("QQIP_LISTEN_HOST", "0.0.0.0")
-        self._listen_port = self._safe_int(os.getenv("QQIP_LISTEN_PORT", "8787"), 8787)
-        self._public_base_url = os.getenv("QQIP_PUBLIC_BASE_URL", "").strip()
+        self._listen_host = str(
+            self._cfg_get("tracker_host", os.getenv("QQIP_LISTEN_HOST", "0.0.0.0"))
+        ).strip() or "0.0.0.0"
+        self._listen_port = self._safe_int(
+            str(self._cfg_get("tracker_port", os.getenv("QQIP_LISTEN_PORT", "8787"))),
+            8787,
+        )
+        self._public_base_url = str(
+            self._cfg_get("public_base_url", os.getenv("QQIP_PUBLIC_BASE_URL", ""))
+        ).strip()
         self._http_server: ThreadingHTTPServer | None = None
         self._http_thread: threading.Thread | None = None
         self._ip_location_cache: dict[str, str] = {}
-        self._max_records_per_group = 100
-        self._show_limit = 10
+        self._max_records_per_group = max(
+            10,
+            self._safe_int(str(self._cfg_get("max_records_per_group", 100)), 100),
+        )
+        self._show_limit = max(
+            1,
+            self._safe_int(str(self._cfg_get("show_limit", 10)), 10),
+        )
 
     async def initialize(self):
         self._start_consent_http_server()
@@ -534,6 +548,15 @@ class QQIPPlugin(Star):
             return int(value)
         except Exception:
             return default
+
+    def _cfg_get(self, key: str, default: Any) -> Any:
+        try:
+            if hasattr(self.config, "get"):
+                value = self.config.get(key, default)
+                return default if value is None else value
+        except Exception:
+            return default
+        return default
 
     def _get_public_base_url(self) -> str:
         if self._public_base_url:

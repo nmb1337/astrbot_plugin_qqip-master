@@ -1,0 +1,32 @@
+{
+  "tracker_host": {
+    "description": "同意链接 HTTP 服务监听地址",
+    "type": "string",
+    "default": "0.0.0.0",
+    "hint": "通常保留 0.0.0.0 即可"
+  },
+  "tracker_port": {
+    "description": "同意链接 HTTP 服务监听端口",
+    "type": "int",
+    "default": 8787,
+    "hint": "请放行该端口或做反向代理"
+  },
+  "public_base_url": {
+    "description": "公网访问前缀",
+    "type": "string",
+    "default": "",
+    "hint": "例如 https://your-domain.com，不填则默认本地地址"
+  },
+  "show_limit": {
+    "description": "查询时显示的最大记录数",
+    "type": "int",
+    "default": 10,
+    "hint": "最小为 1"
+  },
+  "max_records_per_group": {
+    "description": "每个群内存中保留的最大记录数",
+    "type": "int",
+    "default": 100,
+    "hint": "最小为 10"
+  }
+}

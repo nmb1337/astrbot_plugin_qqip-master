@@ -57,3 +57,9 @@ AstrBot 群聊 IP 归属地记录插件。
 - QQIP_PUBLIC_BASE_URL: 生成链接使用的公网前缀，例如 https://your-domain.com
 
 如果不设置 QQIP_PUBLIC_BASE_URL，插件会生成本地地址链接，群友通常无法直接访问。
+
+## 插件配置（WebUI）
+
+- 本插件已注册配置文件 [_conf_schema.json](_conf_schema.json)。
+- 你可以在 AstrBot 插件管理中直接可视化配置以下项目：tracker_host、tracker_port、public_base_url、show_limit、max_records_per_group。
+- WebUI 配置优先于同名环境变量。
