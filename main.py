@@ -1,7 +1,13 @@
+import hashlib
 import ipaddress
+import os
 import re
+import secrets
+import threading
 from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
@@ -21,11 +27,21 @@ class QQIPPlugin(Star):
         self._group_activity: dict[str, dict[str, datetime]] = {}
         self._group_sender_meta: dict[str, dict[str, dict[str, str]]] = {}
         self._group_network_hints: dict[str, dict[str, list[str]]] = {}
+        self._consent_sessions: dict[str, dict[str, Any]] = {}
+        self._consent_records: dict[str, list[dict[str, str]]] = {}
+        self._consent_lock = threading.Lock()
+        self._hash_salt = secrets.token_hex(16)
+        self._listen_host = os.getenv("QQIP_LISTEN_HOST", "0.0.0.0")
+        self._listen_port = self._safe_int(os.getenv("QQIP_LISTEN_PORT", "8787"), 8787)
+        self._public_base_url = os.getenv("QQIP_PUBLIC_BASE_URL", "").strip()
+        self._http_server: ThreadingHTTPServer | None = None
+        self._http_thread: threading.Thread | None = None
         self._ip_location_cache: dict[str, str] = {}
         self._max_records_per_group = 100
         self._show_limit = 10
 
     async def initialize(self):
+        self._start_consent_http_server()
         logger.info("QQIP 插件已初始化")
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
@@ -187,6 +203,91 @@ class QQIPPlugin(Star):
         lines.append("说明: 若这里没有任何 IP 字段，则平台侧未上报，插件无法推算市级位置。")
         yield event.plain_result("\n".join(lines))
 
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("qqip链接")
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    async def create_consent_link(self, event: AstrMessageEvent, title: str = "群聊的聊天记录"):
+        """生成同意后记录的访问链接。用法: /qqip链接 标题(可选)"""
+        message_obj = getattr(event, "message_obj", None)
+        group_id = str(getattr(message_obj, "group_id", "") or "")
+        if not group_id:
+            yield event.plain_result("该指令仅支持群聊。")
+            return
+
+        session_id = secrets.token_urlsafe(6).replace("-", "").replace("_", "")
+        with self._consent_lock:
+            self._consent_sessions[session_id] = {
+                "group_id": group_id,
+                "title": title or "群聊的聊天记录",
+                "created_at": datetime.now(),
+                "creator": str(self._get_sender_id(message_obj) or ""),
+            }
+            self._consent_records[session_id] = []
+
+        link = f"{self._get_public_base_url()}/qqip/consent/{session_id}"
+        lines = [
+            "已生成同意记录链接。",
+            f"链接ID: {session_id}",
+            f"访问链接: {link}",
+            f"查询命令: /qqip记录 {session_id}",
+        ]
+        if not self._public_base_url:
+            lines.append("提示: 未设置 QQIP_PUBLIC_BASE_URL，当前链接可能仅本机/内网可访问。")
+        yield event.plain_result("\n".join(lines))
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("qqip记录")
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    async def query_consent_records(self, event: AstrMessageEvent, session_id: str = ""):
+        """查询某个同意链接的访问记录。用法: /qqip记录 链接ID"""
+        message_obj = getattr(event, "message_obj", None)
+        group_id = str(getattr(message_obj, "group_id", "") or "")
+        if not group_id:
+            yield event.plain_result("该指令仅支持群聊。")
+            return
+
+        session_id = (session_id or "").strip()
+        if not session_id:
+            yield event.plain_result("用法: /qqip记录 链接ID")
+            return
+
+        with self._consent_lock:
+            session = self._consent_sessions.get(session_id)
+            records = list(self._consent_records.get(session_id, []))
+
+        if not session or str(session.get("group_id", "")) != group_id:
+            yield event.plain_result("未找到该链接ID，或该链接不属于当前群。")
+            return
+
+        if not records:
+            yield event.plain_result("该链接暂无同意访问记录。")
+            return
+
+        title = str(session.get("title", "群聊的聊天记录"))
+        lines: list[str] = [title, "===================="]
+        digest_src: list[str] = []
+
+        for rec in records[-self._show_limit :]:
+            visitor_id = str(rec.get("visitor_id", "unknown"))
+            address = str(rec.get("address", "未知"))
+            time_str = str(rec.get("time", ""))
+            digest_src.append(f"{visitor_id}|{address}|{time_str}")
+
+            lines.extend(
+                [
+                    "ID:",
+                    visitor_id,
+                    f"Address:  {address}",
+                    f"Time:  {time_str}",
+                    "====================",
+                ]
+            )
+
+        lines.append(f"共{len(records)}个")
+        lines.append("摘要:")
+        lines.append(hashlib.md5("\n".join(digest_src).encode("utf-8")).hexdigest())
+        yield event.plain_result("\n".join(lines))
+
     @filter.command("qqip清空", alias={"清空qqip"})
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def clear_records(self, event: AstrMessageEvent):
@@ -198,7 +299,17 @@ class QQIPPlugin(Star):
             return
 
         self._group_records[group_id] = {}
-        yield event.plain_result("已清空当前群的 qqip 记录。")
+        self._group_activity[group_id] = {}
+        self._group_sender_meta[group_id] = {}
+        self._group_network_hints[group_id] = {}
+
+        with self._consent_lock:
+            to_delete = [sid for sid, s in self._consent_sessions.items() if str(s.get("group_id", "")) == group_id]
+            for sid in to_delete:
+                self._consent_sessions.pop(sid, None)
+                self._consent_records.pop(sid, None)
+
+        yield event.plain_result("已清空当前群的 qqip 记录与链接记录。")
 
     async def _resolve_ip_location(self, ip: str) -> str:
         if not ip:
@@ -418,6 +529,207 @@ class QQIPPlugin(Star):
                 uniq.append(h)
         return uniq
 
+    def _safe_int(self, value: str, default: int) -> int:
+        try:
+            return int(value)
+        except Exception:
+            return default
+
+    def _get_public_base_url(self) -> str:
+        if self._public_base_url:
+            return self._public_base_url.rstrip("/")
+        host = self._listen_host
+        if host in ("0.0.0.0", "::"):
+            host = "127.0.0.1"
+        return f"http://{host}:{self._listen_port}"
+
+    def _start_consent_http_server(self):
+        if self._http_server is not None:
+            return
+
+        plugin = self
+
+        class ConsentHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                plugin._handle_consent_http_get(self)
+
+            def log_message(self, format: str, *args: Any):
+                return
+
+        try:
+            self._http_server = ThreadingHTTPServer((self._listen_host, self._listen_port), ConsentHandler)
+            self._http_thread = threading.Thread(target=self._http_server.serve_forever, daemon=True)
+            self._http_thread.start()
+            logger.info(f"QQIP 同意记录 HTTP 服务已启动: {self._listen_host}:{self._listen_port}")
+        except Exception as exc:
+            self._http_server = None
+            self._http_thread = None
+            logger.warning(f"QQIP 同意记录 HTTP 服务启动失败: {exc}")
+
+    def _stop_consent_http_server(self):
+        if self._http_server is None:
+            return
+        try:
+            self._http_server.shutdown()
+            self._http_server.server_close()
+        except Exception as exc:
+            logger.warning(f"QQIP 同意记录 HTTP 服务关闭异常: {exc}")
+        finally:
+            self._http_server = None
+            self._http_thread = None
+
+    def _handle_consent_http_get(self, handler: BaseHTTPRequestHandler):
+        path = urlparse(handler.path).path
+        parts = [p for p in path.split("/") if p]
+
+        if len(parts) == 3 and parts[0] == "qqip" and parts[1] == "consent":
+            session_id = parts[2]
+            self._render_consent_page(handler, session_id)
+            return
+
+        if len(parts) == 4 and parts[0] == "qqip" and parts[1] == "consent" and parts[3] == "ok":
+            session_id = parts[2]
+            self._record_consent_visit(handler, session_id)
+            return
+
+        self._send_html(handler, 404, "<h3>404 Not Found</h3>")
+
+    def _render_consent_page(self, handler: BaseHTTPRequestHandler, session_id: str):
+        with self._consent_lock:
+            session = self._consent_sessions.get(session_id)
+
+        if not session:
+            self._send_html(handler, 404, "<h3>链接不存在或已失效。</h3>")
+            return
+
+        title = str(session.get("title", "群聊的聊天记录"))
+        html = f"""
+<html>
+<head><meta charset=\"utf-8\"><title>{title}</title></head>
+<body style=\"font-family: Arial, sans-serif; max-width: 680px; margin: 40px auto; line-height: 1.6;\">
+  <h2>{title}</h2>
+  <p>本页面用于群聊访问记录统计。</p>
+  <p>继续表示你同意记录：访问时间、城市级归属地、匿名访客ID（不保存原始IP）。</p>
+  <p><a href=\"/qqip/consent/{session_id}/ok\">我同意并继续访问</a></p>
+</body>
+</html>
+"""
+        self._send_html(handler, 200, html)
+
+    def _record_consent_visit(self, handler: BaseHTTPRequestHandler, session_id: str):
+        with self._consent_lock:
+            session = self._consent_sessions.get(session_id)
+
+        if not session:
+            self._send_html(handler, 404, "<h3>链接不存在或已失效。</h3>")
+            return
+
+        ip = self._extract_request_ip(handler)
+        ua = str(handler.headers.get("User-Agent", ""))
+        address = self._resolve_ip_location_sync(ip) if ip else "未知"
+        visitor_id = self._hash_visitor(ip, ua)
+        now_str = datetime.now().strftime("%Y.%m.%d-%H:%M:%S")
+
+        with self._consent_lock:
+            records = self._consent_records.setdefault(session_id, [])
+            records.append(
+                {
+                    "visitor_id": visitor_id,
+                    "address": address,
+                    "time": now_str,
+                }
+            )
+            # 控制内存体积
+            if len(records) > 1000:
+                self._consent_records[session_id] = records[-1000:]
+
+        html = """
+<html>
+<head><meta charset=\"utf-8\"><title>记录成功</title></head>
+<body style=\"font-family: Arial, sans-serif; max-width: 680px; margin: 40px auto; line-height: 1.6;\">
+  <h2>记录成功</h2>
+  <p>已记录你的访问时间和归属地（匿名化处理）。</p>
+  <p>你可以关闭本页面。</p>
+</body>
+</html>
+"""
+        self._send_html(handler, 200, html)
+
+    def _send_html(self, handler: BaseHTTPRequestHandler, status: int, html: str):
+        body = html.encode("utf-8")
+        handler.send_response(status)
+        handler.send_header("Content-Type", "text/html; charset=utf-8")
+        handler.send_header("Content-Length", str(len(body)))
+        handler.end_headers()
+        handler.wfile.write(body)
+
+    def _extract_request_ip(self, handler: BaseHTTPRequestHandler) -> str:
+        candidates: list[str] = []
+
+        xff = str(handler.headers.get("X-Forwarded-For", "")).strip()
+        if xff:
+            candidates.append(xff.split(",")[0].strip())
+
+        for key in ("CF-Connecting-IP", "X-Real-IP", "X-Client-IP"):
+            val = str(handler.headers.get(key, "")).strip()
+            if val:
+                candidates.append(val)
+
+        if handler.client_address and handler.client_address[0]:
+            candidates.append(str(handler.client_address[0]).strip())
+
+        for cand in candidates:
+            try:
+                ipaddress.ip_address(cand)
+                return cand
+            except ValueError:
+                continue
+
+        return ""
+
+    def _hash_visitor(self, ip: str, ua: str) -> str:
+        source = f"{self._hash_salt}|{ip}|{ua[:80]}"
+        return hashlib.sha256(source.encode("utf-8")).hexdigest()[:16]
+
+    def _resolve_ip_location_sync(self, ip: str) -> str:
+        if not ip:
+            return "未知"
+
+        if ip in self._ip_location_cache:
+            return self._ip_location_cache[ip]
+
+        try:
+            ip_obj = ipaddress.ip_address(ip)
+            if ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_reserved:
+                self._ip_location_cache[ip] = "局域网/保留地址"
+                return self._ip_location_cache[ip]
+        except ValueError:
+            self._ip_location_cache[ip] = "非法 IP"
+            return self._ip_location_cache[ip]
+
+        try:
+            with httpx.Client(timeout=5) as client:
+                resp = client.get(f"https://ipwho.is/{ip}?lang=zh")
+                data = resp.json()
+
+            if data.get("success") is False:
+                location = "未知"
+            else:
+                country = str(data.get("country") or "")
+                region = str(data.get("region") or "")
+                city = str(data.get("city") or "")
+                location = "".join([country, region, city]).strip() or "未知"
+        except Exception as exc:
+            logger.warning(f"查询 IP 归属地失败(同步): {ip} {exc}")
+            location = "未知"
+
+        self._ip_location_cache[ip] = location
+        return location
+
+    async def terminate(self):
+        self._stop_consent_http_server()
+        logger.info("QQIP 插件已终止")
+
     def _get_sender_id(self, message_obj: Any) -> str:
         sender = getattr(message_obj, "sender", None)
         if sender is None:
@@ -435,6 +747,3 @@ class QQIPPlugin(Star):
                     return str(val)
 
         return ""
-
-    async def terminate(self):
-        logger.info("QQIP 插件已终止")
