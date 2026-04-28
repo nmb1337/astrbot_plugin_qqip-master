@@ -1,0 +1,9 @@
+name: astrbot_plugin_qqip
+display_name: QQ 窥屏定位
+desc: 监听群聊原始事件中的 IP 字段，并输出 IP 与归属地汇总。
+version: v1.0.0
+author: qqip
+repo: https://github.com/yourname/astrbot_plugin_qqip
+support_platforms:
+  - aiocqhttp
+  - qq_official
