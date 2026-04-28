@@ -1,4 +1,3 @@
-import hashlib
 import ipaddress
 import re
 from datetime import datetime
@@ -63,14 +62,19 @@ class QQIPPlugin(Star):
             self._group_records[group_id] = dict(sorted_items[: self._max_records_per_group])
 
     @filter.permission_type(filter.PermissionType.ADMIN)
-    @filter.command("谁在窥屏", alias={"窥屏", "qqip", "谁在看屏"})
+    @filter.command("qqip")
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
-    async def who_is_peeping(self, event: AstrMessageEvent):
-        """显示当前群已记录到的 IP 和归属地（仅展示本插件可见数据）。"""
+    async def query_qqip(self, event: AstrMessageEvent, target_qq: str = ""):
+        """管理员查询指定 QQ 的 IP 归属地。用法: /qqip 123456"""
         message_obj = getattr(event, "message_obj", None)
         group_id = str(getattr(message_obj, "group_id", "") or "")
         if not group_id:
             yield event.plain_result("该指令仅支持群聊。")
+            return
+
+        target_qq = re.sub(r"\D", "", target_qq or "")
+        if not target_qq:
+            yield event.plain_result("用法: /qqip QQ号")
             return
 
         records_map = self._group_records.get(group_id, {})
@@ -79,13 +83,16 @@ class QQIPPlugin(Star):
             return
 
         records = sorted(
-            records_map.values(),
+            [rec for rec in records_map.values() if str(rec.get("sender_id", "")) == target_qq],
             key=lambda item: item.get("timestamp", datetime.min),
             reverse=True,
         )[: self._show_limit]
 
-        lines: list[str] = ["谁在窥屏", "===================="]
-        digest_source: list[str] = []
+        if not records:
+            yield event.plain_result(f"未找到 QQ {target_qq} 的 IP 记录。")
+            return
+
+        lines: list[str] = [f"QQ {target_qq} 的 IP 记录", "===================="]
 
         for rec in records:
             ip = str(rec.get("ip", ""))
@@ -93,7 +100,6 @@ class QQIPPlugin(Star):
             if not isinstance(ts, datetime):
                 ts = datetime.now()
             addr = await self._resolve_ip_location(ip)
-            digest_source.append(f"{ip}|{addr}|{ts.isoformat()}")
 
             lines.extend(
                 [
@@ -105,14 +111,11 @@ class QQIPPlugin(Star):
                 ]
             )
 
-        digest = hashlib.md5("\n".join(digest_source).encode("utf-8")).hexdigest()
         lines.append(f"共{len(records)}个")
-        lines.append("摘要:")
-        lines.append(digest)
 
         yield event.plain_result("\n".join(lines))
 
-    @filter.command("窥屏清空", alias={"qqip清空", "清空窥屏"})
+    @filter.command("qqip清空", alias={"清空qqip"})
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def clear_records(self, event: AstrMessageEvent):
         """清空当前群的记录。"""
